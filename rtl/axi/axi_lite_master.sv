@@ -1,18 +1,15 @@
 //============================================================================
-// axi_lite_master.sv — Core-to-AXI4-Lite Master Bridge
+// axi_lite_master.sv — Core-to-AXI4-Lite Master Bridge (v2)
 //
-// Converts the processor core's simple memory interface into AXI4-Lite
-// transactions. Handles one outstanding transaction at a time.
+// Simplified state machine with explicit WAIT_B / WAIT_R states.
+// Handles one outstanding transaction at a time.
 //
-// Core interface:      AXI-Lite interface:
-//   addr, wdata          AW, W, AR channels (master → slave)
-//   rd, wr, be           B, R channels      (slave → master)
-//   rdata, valid
+//   Write: IDLE → WR_AW_W (present AW+W) → WAIT_B (wait for bresp) → IDLE
+//   Read:  IDLE → RD_AR (present AR) → WAIT_R (wait for rdata) → IDLE
 //
-// Protocol:
-//   Write: Assert AW+W simultaneously, wait for B response
-//   Read:  Assert AR, wait for R response
-//   Core is stalled (valid deasserted) until AXI transaction completes
+// AW and W are always presented simultaneously. If a slave accepts
+// one before the other, we track which is done and keep presenting
+// the remaining one.
 //============================================================================
 
 module axi_lite_master
@@ -21,210 +18,162 @@ module axi_lite_master
     input  logic        clk,
     input  logic        rst_n,
 
-    // ---- Core-side interface ----
+    // Core-side interface
     input  logic [31:0] core_addr,
     input  logic [31:0] core_wdata,
     input  logic        core_rd,
     input  logic        core_wr,
     input  logic [3:0]  core_be,
     output logic [31:0] core_rdata,
-    output logic        core_valid,     // Transaction complete, data ready
+    output logic        core_valid,
 
-    // ---- AXI-Lite Master interface ----
-    // Write Address channel
+    // AXI-Lite Master interface
     output logic [31:0] m_axi_awaddr,
     output logic [2:0]  m_axi_awprot,
     output logic        m_axi_awvalid,
     input  logic        m_axi_awready,
 
-    // Write Data channel
     output logic [31:0] m_axi_wdata,
     output logic [3:0]  m_axi_wstrb,
     output logic        m_axi_wvalid,
     input  logic        m_axi_wready,
 
-    // Write Response channel
     input  logic [1:0]  m_axi_bresp,
     input  logic        m_axi_bvalid,
     output logic        m_axi_bready,
 
-    // Read Address channel
     output logic [31:0] m_axi_araddr,
     output logic [2:0]  m_axi_arprot,
     output logic        m_axi_arvalid,
     input  logic        m_axi_arready,
 
-    // Read Data channel
     input  logic [31:0] m_axi_rdata,
     input  logic [1:0]  m_axi_rresp,
     input  logic        m_axi_rvalid,
     output logic        m_axi_rready
 );
 
+    typedef enum logic [2:0] {
+        IDLE,
+        WR_AW_W,    // Presenting AW and W channels
+        WAIT_B,     // AW+W accepted, waiting for B response
+        RD_AR,      // Presenting AR channel
+        WAIT_R      // AR accepted, waiting for R response
+    } state_t;
+
+    state_t state;
+
+    // Latched request
+    logic [31:0] req_addr, req_wdata;
+    logic [3:0]  req_be;
+
+    // Track AW/W acceptance independently within WR_AW_W state
+    logic aw_accepted, w_accepted;
+
+    // Both channels accepted?
+    wire aw_done_now = aw_accepted || (m_axi_awvalid && m_axi_awready);
+    wire w_done_now  = w_accepted  || (m_axi_wvalid  && m_axi_wready);
+    wire both_accepted = aw_done_now && w_done_now;
+
     // -----------------------------------------------------------------------
     // State machine
     // -----------------------------------------------------------------------
-    typedef enum logic [2:0] {
-        IDLE,
-        WR_ADDR,        // AW accepted, waiting for W
-        WR_DATA,        // W accepted, waiting for AW
-        WR_RESP,        // AW+W both accepted, waiting for B
-        RD_ADDR,        // AR pending
-        RD_RESP         // AR accepted, waiting for R
-    } state_t;
-
-    state_t state, state_next;
-
-    // Latched request
-    logic [31:0] req_addr;
-    logic [31:0] req_wdata;
-    logic [3:0]  req_be;
-    logic        req_is_write;
-
-    // Track which write channels have been accepted
-    logic aw_done, w_done;
-
-    // -----------------------------------------------------------------------
-    // State register
-    // -----------------------------------------------------------------------
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            state <= IDLE;
-        else
-            state <= state_next;
-    end
-
-    // -----------------------------------------------------------------------
-    // Latch request on acceptance
-    // -----------------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            req_addr     <= '0;
-            req_wdata    <= '0;
-            req_be       <= '0;
-            req_is_write <= 1'b0;
-        end else if (state == IDLE && (core_rd || core_wr)) begin
-            req_addr     <= core_addr;
-            req_wdata    <= core_wdata;
-            req_be       <= core_be;
-            req_is_write <= core_wr;
-        end
-    end
-
-    // Track AW/W channel acceptance independently
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            aw_done <= 1'b0;
-            w_done  <= 1'b0;
-        end else if (state == IDLE) begin
-            aw_done <= 1'b0;
-            w_done  <= 1'b0;
+            state       <= IDLE;
+            req_addr    <= '0;
+            req_wdata   <= '0;
+            req_be      <= '0;
+            aw_accepted <= 1'b0;
+            w_accepted  <= 1'b0;
         end else begin
-            if (m_axi_awvalid && m_axi_awready) aw_done <= 1'b1;
-            if (m_axi_wvalid  && m_axi_wready)  w_done  <= 1'b1;
+            case (state)
+                IDLE: begin
+                    aw_accepted <= 1'b0;
+                    w_accepted  <= 1'b0;
+                    if (core_wr) begin
+                        req_addr  <= core_addr;
+                        req_wdata <= core_wdata;
+                        req_be    <= core_be;
+                        state     <= WR_AW_W;
+                    end else if (core_rd) begin
+                        req_addr <= core_addr;
+                        state    <= RD_AR;
+                    end
+                end
+
+                WR_AW_W: begin
+                    // Track individual channel acceptance
+                    if (m_axi_awvalid && m_axi_awready) aw_accepted <= 1'b1;
+                    if (m_axi_wvalid  && m_axi_wready)  w_accepted  <= 1'b1;
+
+                    // Both accepted? Check if B already available
+                    if (both_accepted) begin
+                        if (m_axi_bvalid)
+                            state <= IDLE;  // Lucky: B came same cycle
+                        else
+                            state <= WAIT_B;
+                    end
+                end
+
+                WAIT_B: begin
+                    if (m_axi_bvalid && m_axi_bready)
+                        state <= IDLE;
+                end
+
+                RD_AR: begin
+                    if (m_axi_arvalid && m_axi_arready) begin
+                        if (m_axi_rvalid)
+                            state <= IDLE;  // Lucky: R came same cycle
+                        else
+                            state <= WAIT_R;
+                    end
+                end
+
+                WAIT_R: begin
+                    if (m_axi_rvalid && m_axi_rready)
+                        state <= IDLE;
+                end
+
+                default: state <= IDLE;
+            endcase
         end
     end
 
     // -----------------------------------------------------------------------
-    // Next-state logic
-    // -----------------------------------------------------------------------
-    always_comb begin
-        state_next = state;
-
-        case (state)
-            IDLE: begin
-                if (core_wr)
-                    state_next = WR_RESP;  // Present AW+W together
-                else if (core_rd)
-                    state_next = RD_ADDR;
-            end
-
-            WR_RESP: begin
-                // Stay until both AW and W accepted AND B received
-                if ((aw_done || (m_axi_awvalid && m_axi_awready)) &&
-                    (w_done  || (m_axi_wvalid  && m_axi_wready)) &&
-                    m_axi_bvalid)
-                    state_next = IDLE;
-                // If only AW accepted
-                else if ((aw_done || (m_axi_awvalid && m_axi_awready)) &&
-                         !(w_done || (m_axi_wvalid && m_axi_wready)))
-                    state_next = WR_DATA;
-                // If only W accepted
-                else if (!(aw_done || (m_axi_awvalid && m_axi_awready)) &&
-                         (w_done || (m_axi_wvalid && m_axi_wready)))
-                    state_next = WR_ADDR;
-            end
-
-            WR_ADDR: begin
-                if (m_axi_awvalid && m_axi_awready) begin
-                    if (m_axi_bvalid)
-                        state_next = IDLE;
-                    else
-                        state_next = WR_RESP; // Reuse WR_RESP to wait for B
-                end
-            end
-
-            WR_DATA: begin
-                if (m_axi_wvalid && m_axi_wready) begin
-                    if (m_axi_bvalid)
-                        state_next = IDLE;
-                    else
-                        state_next = WR_RESP;
-                end
-            end
-
-            RD_ADDR: begin
-                if (m_axi_arvalid && m_axi_arready)
-                    state_next = RD_RESP;
-            end
-
-            RD_RESP: begin
-                if (m_axi_rvalid)
-                    state_next = IDLE;
-            end
-
-            default: state_next = IDLE;
-        endcase
-    end
-
-    // -----------------------------------------------------------------------
-    // Output logic
+    // AXI output signals
     // -----------------------------------------------------------------------
 
-    // Write Address channel
+    // Write Address
     assign m_axi_awaddr  = req_addr;
     assign m_axi_awprot  = 3'b000;
-    assign m_axi_awvalid = (state == WR_RESP && !aw_done) ||
-                           (state == WR_ADDR);
+    assign m_axi_awvalid = (state == WR_AW_W) && !aw_accepted;
 
-    // Write Data channel
+    // Write Data
     assign m_axi_wdata  = req_wdata;
     assign m_axi_wstrb  = req_be;
-    assign m_axi_wvalid = (state == WR_RESP && !w_done) ||
-                          (state == WR_DATA);
+    assign m_axi_wvalid = (state == WR_AW_W) && !w_accepted;
 
-    // Write Response — always ready when waiting
-    assign m_axi_bready = (state == WR_RESP) || (state == WR_ADDR) || (state == WR_DATA);
+    // Write Response — ready in WR_AW_W (in case of same-cycle B) and WAIT_B
+    assign m_axi_bready = (state == WR_AW_W) || (state == WAIT_B);
 
-    // Read Address channel
+    // Read Address
     assign m_axi_araddr  = req_addr;
     assign m_axi_arprot  = 3'b000;
-    assign m_axi_arvalid = (state == RD_ADDR);
+    assign m_axi_arvalid = (state == RD_AR);
 
-    // Read Data — always ready when waiting for response
-    assign m_axi_rready = (state == RD_RESP);
+    // Read Data — ready in RD_AR (same-cycle) and WAIT_R
+    assign m_axi_rready = (state == RD_AR) || (state == WAIT_R);
 
     // -----------------------------------------------------------------------
     // Core-side response
     // -----------------------------------------------------------------------
-    // Transaction completes when:
-    //   Write: B response received
-    //   Read:  R response received
-    assign core_valid = ((state == WR_RESP || state == WR_ADDR || state == WR_DATA) &&
-                          m_axi_bvalid && m_axi_bready) ||
-                        (state == RD_RESP && m_axi_rvalid && m_axi_rready) ||
-                        (state == IDLE && !(core_rd || core_wr));
+    wire wr_completing = (state == WAIT_B && m_axi_bvalid) ||
+                         (state == WR_AW_W && both_accepted && m_axi_bvalid);
+    wire rd_completing = (state == WAIT_R && m_axi_rvalid) ||
+                         (state == RD_AR && m_axi_arready && m_axi_rvalid);
 
+    assign core_valid = (state == IDLE) || wr_completing || rd_completing;
     assign core_rdata = m_axi_rdata;
 
 endmodule
